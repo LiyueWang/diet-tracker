@@ -12,14 +12,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "cors": "^2.8.6",
     "dexie": "^4.4.6",
+    "dotenv": "^18.0.3",
     "express": "^5.2.1",
+    "openai": "^7.22.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "recharts": "^3.10.1",
     "zustand": "^5.0.15"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
     "@types/react": "^19.3.0",

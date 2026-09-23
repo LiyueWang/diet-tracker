@@ -102,7 +102,9 @@ npm run typecheck    # TypeScript 类型检查
 ### 各阶段验收
 
 - **Phase 0**：Dexie 表能创建，能写入一条测试记录并在 DevTools 的 IndexedDB 中看到
-- **Phase 1**：`curl -X POST localhost:8787/api/ai/parse -d '{"text":"200克鸡胸肉"}'` 返回合法 JSON
+- **Phase 1**：`curl -X POST localhost:8787/api/ai/parse -H "Content-Type: application/json" -d '{"text":"200克鸡胸肉"}'` 返回合法 JSON
+  （`Content-Type` 必须显式指定：curl 的 `-d` 默认发 `application/x-www-form-urlencoded`，
+  那样 `express.json()` 不会解析 body，接口会返回 `400 {"error":"text is required"}`）
 - **Phase 2**：浏览器中完成"输入文字 → 看到确认卡片 → 点击保存 → 今日汇总更新"全流程
 - **Phase 3**：Chrome 中点击麦克风按钮，语音识别结果进入解析流程
 - **Phase 4**：食物库和补剂方案能增删改查，食物库匹配逻辑经测试正确
@@ -147,3 +149,41 @@ npm run typecheck    # TypeScript 类型检查
   索引与 stores 定义逐条一致、`foodLibrary.aliases` 的 `multiEntry === true`，测试记录已真实落库；控制台无报错
 - 踩坑：`setActivePlan` 只刷新被改动的行，本来就 `active = 0` 的方案不重写 `updatedAt`，
   写验收断言时不能假设"所有非目标方案的时间戳都会变"
+
+### 2026-09-23 Phase 1（AI 本地代理）
+- 决策：DeepSeek 走 `openai` SDK + `baseURL=https://api.deepseek.com`；客户端惰性创建，
+  因为 ESM 的 import 会被提升，模块顶层读 `process.env` 会拿到 dotenv 注入之前的值
+- 决策：`/api/ai/parse`、`/api/ai/report` 对外返回 camelCase（`weightG` / `itemType` / `proteinG`），
+  把模型的 snake_case 在 `server/deepseek.ts` 里一次性转换，Phase 2 可直接映射成 `FoodItem`
+- 决策：响应头带 `X-Cache: HIT|MISS`，用于确认缓存命中，不改 body 结构
+- 决策：`incrementCall()` 只在调用成功后执行 —— 缓存命中和失败的请求都不消耗额度；
+  查缓存发生在 `canCall()` 之前，所以额度用完时缓存命中依然返回 200
+- 决策：`server/cache.ts` 除规定的 5 个函数外还导出 `hashString` / `getCacheTtlHours` / `getDailyLimit`；
+  hash 结果拼接输入长度，降低 32 位 hash 的碰撞风险
+- 决策：每日计数按**本地日期**（YYYY-MM-DD）重置，不用 UTC，否则时区东八区会在早上 8 点才跨天
+- 决策：保留 Phase 0 的 `GET /api/health`；启动日志固定为 `AI proxy on http://localhost:PORT`
+- 踩坑：curl 的 `-d` 默认 Content-Type 是 `application/x-www-form-urlencoded`，不加
+  `-H "Content-Type: application/json"` 时 `express.json()` 不解析 body，接口返回
+  `400 {"error":"text is required"}` —— 原 Phase 1 验收命令漏了这个头，已修正
+- 踩坑：Node 的 fetch/undici 报错可能只有一句 `terminated`，真实原因在 `error.cause` 里
+  （例如 `code=UND_ERR_SOCKET`）；`deepseek.ts` 现在会把 cause 链摊平打印。
+  曾出现过一次无规律的 `terminated`，重试 6 次未复现，判定为瞬时 socket 失败
+- 决策：传输层故障额外重试一次、延迟 1500ms。判据是套接字错误码
+  （`ECONNRESET` / `UND_ERR_SOCKET` / 各类 timeout 等）、`APIConnection*` 异常，
+  或没有 HTTP 状态的连接类报错；带 status 的响应错误一律不重试
+- 踩坑：openai SDK 自带 `maxRetries=2`，它那 3 次尝试都挤在 1-2 秒内，
+  所以网络抖动持续几秒时会被整体吞掉 —— 额外这次延迟就是为了覆盖更晚的时间窗口，
+  不是简单叠加。若将来要改，注意别把总尝试次数叠成 6 次以上
+- 验证：把 `DEEPSEEK_BASE_URL` 指向死端口，请求耗时 4.22s、日志恰好出现 1 次重试告警、
+  最终报错为 `Connection error. <- fetch failed <- bad port`；
+  指向返回 404 的本地服务时耗时 0.13s 且无重试告警，证明状态码错误不会被重试
+- 踩坑：曾误判 `deepseek-flash` 不是有效模型名，实际是 DeepSeek-V4.1-Flash。
+  判断模型是否可用要查 `GET https://api.deepseek.com/models`，不要靠记忆
+- 踩坑：PowerShell 命令行里的中文有被转坏的风险，需要传中文 body 时用
+  `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` 写无 BOM 文件 +
+  `curl.exe --data-binary "@file"`，否则 `express.json()` 可能直接 400
+- 验证命令：`npm run dev:server` 后
+  `curl -X POST localhost:8787/api/ai/parse -H "Content-Type: application/json" -d '{"text":"中午吃了200克鸡胸肉和150克米饭"}'`
+  正确拆出「鸡胸肉 200g」「米饭 150g」两条 items；同一文本第二次请求返回 `X-Cache: HIT`；
+  把 `AI_DAILY_LIMIT` 临时设为 2 后，第 3 条不同文本返回 `429 {"error":"Daily AI call limit reached"}`，
+  而重复已缓存文本仍返回 200
