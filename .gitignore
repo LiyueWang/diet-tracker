@@ -1,0 +1,22 @@
+# 依赖与构建产物
+node_modules/
+dist/
+dist-ssr/
+*.tsbuildinfo
+
+# 本地环境变量：内含 DEEPSEEK_API_KEY，绝不能入库
+.env
+.env.local
+.env.*.local
+
+# 编辑器与操作系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志与缓存
+*.log
+npm-debug.log*
+.vite/
