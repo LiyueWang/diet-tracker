@@ -1,0 +1,2 @@
+/* 样式入口：Tailwind v4 用 @import 引入，由 Vite 插件在构建时编译（不需要 PostCSS 配置） */
+@import 'tailwindcss';

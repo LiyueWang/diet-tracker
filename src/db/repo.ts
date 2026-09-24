@@ -109,6 +109,14 @@ export async function updateMeal(id: string, patch: MealPatch): Promise<void> {
   await withRepoContext('updateMeal', () => patchRow(db.meals, '餐次', id, patch));
 }
 
+/**
+ * 按 id 取餐次。返回原始行（包括 deleted = 1 的），
+ * 由调用方决定怎么处理逻辑删除 —— 编辑入口需要能区分"不存在"和"已删除"。
+ */
+export async function getMealById(id: string): Promise<Meal | undefined> {
+  return withRepoContext('getMealById', () => db.meals.get(id));
+}
+
 export async function softDeleteMeal(id: string): Promise<void> {
   // Meal 有 deleted 字段，按项目约定走逻辑删除，数据保留以便回溯历史统计
   await withRepoContext('softDeleteMeal', () => patchRow(db.meals, '餐次', id, { deleted: 1 }));
@@ -123,14 +131,20 @@ export async function addFoodItems(mealId: string, items: FoodItemInput[]): Prom
       throw new Error(`所属餐次不存在: ${mealId}`);
     }
 
-    const now = new Date().toISOString();
-    const rows: FoodItem[] = items.map((item) => ({
-      ...item,
-      id: crypto.randomUUID(),
-      mealId,
-      createdAt: now,
-      updatedAt: now,
-    }));
+    // 同批写入的条目按序递增 1ms：createdAt 是 getItemsByMealId 的排序键，
+    // 全部用同一个时间戳会让索引里同键的顺序跟着主键（UUID）走，
+    // 编辑保存（先删后插、UUID 全新）之后条目顺序就会乱跳。
+    const baseTime = Date.now();
+    const rows: FoodItem[] = items.map((item, index) => {
+      const timestamp = new Date(baseTime + index).toISOString();
+      return {
+        ...item,
+        id: crypto.randomUUID(),
+        mealId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+    });
     if (rows.length === 0) {
       return rows;
     }
@@ -139,10 +153,28 @@ export async function addFoodItems(mealId: string, items: FoodItemInput[]): Prom
   });
 }
 
+/**
+ * 条目排序：createdAt 是主键（写入时按序号递增 1ms，见 addFoodItems），
+ * id 只作兜底。两者都相等才认为顺序无差别 —— 因为 replaceMealItems 每次都会
+ * 生成全新 UUID，光靠 id 兜底并不能保证跨次编辑的顺序稳定，真正的稳定来源是带偏移的 createdAt。
+ */
+function compareItems(a: FoodItem, b: FoodItem): number {
+  if (a.createdAt !== b.createdAt) {
+    return a.createdAt < b.createdAt ? -1 : 1;
+  }
+  if (a.id !== b.id) {
+    return a.id < b.id ? -1 : 1;
+  }
+  return 0;
+}
+
 export async function getItemsByMealId(mealId: string): Promise<FoodItem[]> {
-  return withRepoContext('getItemsByMealId', () =>
-    db.foodItems.where('mealId').equals(mealId).sortBy('createdAt'),
-  );
+  return withRepoContext('getItemsByMealId', async () => {
+    // 这里不能用 sortBy('createdAt')：Dexie 的 sortBy 只接受单个排序键，
+    // 表达不了 (createdAt, id) 这个复合顺序，所以在内存里排。
+    const items = await db.foodItems.where('mealId').equals(mealId).toArray();
+    return items.sort(compareItems);
+  });
 }
 
 export async function updateFoodItem(id: string, patch: FoodItemPatch): Promise<void> {
@@ -154,6 +186,23 @@ export async function deleteItemsByMealId(mealId: string): Promise<number> {
   // 条目是餐次的从属数据，随餐次清掉不会丢失独立的历史信息。
   return withRepoContext('deleteItemsByMealId', () =>
     db.foodItems.where('mealId').equals(mealId).delete(),
+  );
+}
+
+/**
+ * 用一批新条目整体替换某个餐次的条目（编辑记录时用）。
+ * 删除和写入必须同事务：中途失败时不能留下"旧条目已删、新条目没写进去"的空餐次。
+ *
+ * 事务里额外声明 db.meals，是因为 addFoodItems 会读 db.meals 校验餐次是否存在，
+ * 而 Dexie 对事务未声明表的访问会抛 NotFound: Table meals not part of transaction
+ * （dexie.js 的 checkTableInTransaction 对读和写都做校验）。
+ */
+export async function replaceMealItems(mealId: string, items: FoodItemInput[]): Promise<void> {
+  await withRepoContext('replaceMealItems', () =>
+    db.transaction('rw', db.meals, db.foodItems, async () => {
+      await deleteItemsByMealId(mealId);
+      await addFoodItems(mealId, items);
+    }),
   );
 }
 

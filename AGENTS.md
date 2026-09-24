@@ -62,6 +62,10 @@ npm run typecheck    # TypeScript 类型检查
 - ❌ 不要把 DeepSeek API Key 写进前端代码或提交到 git
 - ❌ 不要引入 Supabase、Firebase、Capacitor 等第二版才用的依赖
 - ❌ 不要引入 UI 组件库（用 Tailwind 手写）
+  - ❌ 不要引入 antd / mui / shadcn 等 UI 组件库
+  - ✅ 样式统一用 Tailwind CSS v4，通过 @tailwindcss/vite 插件集成
+  - ❌ 不要安装 postcss、autoprefixer，不要创建 tailwind.config.js
+  - ❌ 不要使用 @tailwind base / components / utilities 旧指令
 - ❌ 不要一次修改超过 5 个文件，超过就拆成多个步骤
 - ❌ 不要在前端直连 DeepSeek，所有 AI 调用必须经过 `server/`
 - ❌ 不要删除或重命名已有函数，除非我明确要求
@@ -187,3 +191,46 @@ npm run typecheck    # TypeScript 类型检查
   正确拆出「鸡胸肉 200g」「米饭 150g」两条 items；同一文本第二次请求返回 `X-Cache: HIT`；
   把 `AI_DAILY_LIMIT` 临时设为 2 后，第 3 条不同文本返回 `429 {"error":"Daily AI call limit reached"}`，
   而重复已缓存文本仍返回 200
+
+### 2026-09-24 Phase 2（Record 页 + Today 汇总页）
+- 决策：Tailwind CSS v4 走 `@tailwindcss/vite` 插件，不装 postcss/autoprefixer、不建 `tailwind.config.js`；
+  样式入口 `src/index.css` 只有一行 `@import 'tailwindcss'`
+- 决策：`src/types/ai.ts` 用 camelCase（`weightG` / `itemType` / `estimated.proteinG`），
+  与 `/api/ai/parse` 的实际响应一致。规格里写的是 snake_case，照抄会让类型与网络不符：
+  TS 检查能过，运行时字段全是 `undefined`
+- 决策：命中食物库但缺克数时，`dataSource` 仍标 `food_library` 并保留 `foodLibraryId`，
+  数值暂用 AI 估算占位；用户在卡片上补克数后按食物库重算（否则"库"这个标签是假的）
+- 决策：确认卡片的行用本地 key（`crypto.randomUUID`）而不是数组下标 —— 删掉中间一行会让
+  React 复用错输入框（焦点乱跳）、"已存入"状态也会串到别的行
+- 决策：`src/services/date.ts` 收拢 `todayIso` / `nowHhMm` / `describeDay`，避免各页面各拼一份
+- 踩坑：Playwright 的 `fill()` 对 `<input type="time">` 不触发 React 的 `onChange`：
+  DOM 值看起来改了，但 state 没变，一旦重渲染就被拉回旧值（表现为"时间改了没保存"）。
+  用真实按键（click + `pressSequentially`）才行。这不是应用的问题
+- 验证：浏览器里跑通"输入 → 解析 → 确认卡片 → 保存 → 今日汇总"，
+  卡片数值与总览一致（394 kcal = P49.9/C38.9/F4.1）；保存后跳转 Today 并提示「已保存」
+
+### 2026-09-24 Phase 2.5（编辑与删除入口）
+- 决策：`replaceMealItems` 用 Dexie 事务包住"先删后插"，避免中途失败留下空餐次；
+  事务作用域必须同时声明 `db.meals` —— `addFoodItems` 会读它校验餐次是否存在，
+  而 Dexie 对事务未声明表的访问会抛 `NotFound: Table meals not part of transaction`
+- 决策：Today 从"按餐次类型合并"改成"一条记录一个卡片"。合并后一个分区里可能有多个
+  `meal.id`，编辑/删除按钮无法定位；空餐次类型仍显示一个「暂无记录」占位卡
+- 决策：删除顺序固定为 `deleteItemsByMealId` → `softDeleteMeal`（先清条目再软删餐次），
+  反过来会留下"餐次已标记删除、条目还挂在上面"的残骸
+- 决策：Toast 显示后立刻 `navigate(pathname, { replace: true, state: null })` 清掉 router state，
+  否则刷新会重放；`replace: true` 是必须的，不然返回键会回到带 toast 的那一页
+- 踩坑：清 state 会让读 state 的 effect 重入一次、执行上一次的 cleanup —— 如果自动隐藏的
+  定时器挂在那里，刚设好就会被取消，提示永远不消失。必须把定时器拆成独立的 effect（依赖 `notice`）
+- 踩坑：`getItemsByMealId` 原本 `sortBy('createdAt')`，而 `addFoodItems` 给同批写入的行
+  **同一个时间戳**，同键顺序会跟着主键（UUID）走；`replaceMealItems` 重插后 UUID 全新，
+  条目顺序就乱跳（表现为"编辑保存后条目顺序变"）。修法：主修 = 写入时按序号递增 1ms，
+  兜底 = 读取时按 `(createdAt, id)` 内存排序
+- 踩坑：Dexie 的 `sortBy` 只接受单个排序键，`(createdAt, id)` 这种复合顺序只能取回后在内存里排；
+  建复合索引等于改 `schema.ts` 表结构，按约定不做
+- 踩坑：软删除的 meal 不会连带清理它的 items（本阶段按要求保持原样），
+  所以**删除流程必须自己先清条目**；将来若有代码不经过 meals 直接聚合 items，要注意这些孤儿行
+- 踩坑：内置浏览器的 `playwright.evaluate` 是只读沙盒，取不到 modules / `crypto` / `indexedDB` /
+  `history`，所以数据库层面的验证（`deleted` 字段、物理删除）只能在真实 DevTools 里人工做一次
+- 验证：A1–A12 全部通过（新建链路、食物库匹配与等比换算、needsWeight 拦截、改克数/餐次/时间、
+  内联删除确认、不存在的 id、新建回归、同类型多卡片互不影响、编辑往返顺序稳定、toast 刷新不重放）；
+  数据库层面 B1/B2 由人工在 DevTools 确认
