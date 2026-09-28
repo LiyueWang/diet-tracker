@@ -306,3 +306,48 @@ npm run typecheck    # TypeScript 类型检查
 - 说明：4.4 的行为（切回 new 时空表单、不弹提示条）由 `loadDraft` 返回 null 推出，
   与挂载路径调的是同一个函数；没有在真实 App 的 tab 里塞过期草稿走一遍切换路径，
   因为那个 tab 的 `sessionStorage` 沙箱工具够不到
+
+### 2026-09-28 Phase 3（语音输入）
+> 本阶段进行中，先记第一步（`src/services/speech.ts`）的实现补充，其余随进度追加。
+
+- 实现补充：`SpeechRecognition` 的类型用**最小结构类型 + `as unknown as SpeechWindow` 收窄**，
+  不引第三方 `@types/dom-speech-recognition` 之类的包 —— 那个包会把整个 API 表面全带进来，
+  而实际只用到 `start` / `stop` / `onresult` / `onerror` / `onend` 五个成员。
+  这些类型声明留在 `speech.ts` **内部不导出**：对外只暴露业务接口
+  （`startRecognition` / `SpeechError` / `isSpeechSupported` / `getErrorMessage`），
+  调用方不需要接触底层类型
+- 实现补充：`speech.ts` 内部的 `finish()` **必须幂等**（`finished` 标志），保证 `onEnd` 只触发一次。
+  触发路径有三条：`onend` 事件、`stop()` 抛错的 catch、`start()` 抛错的 catch；
+  如果 `finish()` 不幂等，调用方会收到重复的 `onEnd`，一旦 onEnd 里有副作用（清 ref、写日志）就会重复执行。
+  另外 `start()` 抛错时必须**先 `onError` 再 `onEnd`** —— 反过来的话，调用方是"先退出录音状态、
+  再弹错误提示"，用户视觉上会错位
+- 实现补充：`onResult` 只在 `transcript.trim() !== ''` 时触发，防止空格污染输入框。
+  Chrome 在"没听到声音"时一般走 `onerror('no-speech')`，空 transcript 比较罕见，
+  但可能出现在低置信度、实现差异、服务返回空值等情况 —— 罕见不等于不写，
+  输入框里莫名多一个空格是那种最难查的 bug
+- 决策：**用户主动取消不算错误**。用户在识别过程中点停止时，浏览器通常也会派发 `aborted`，
+  但 `onError` 是留给"用户需要知道、可能需要采取行动"的情况（权限被拒、网络异常、
+  没听清），主动取消只该安静结束。所以 `speech.ts` 内部记一个 `userStopped` 标志：
+  `stop()` 置位，`onerror` 收到 `aborted` 且该标志为真时**不报错**、直接收尾走 `onEnd`，
+  `finish()` 里复位。这样"这次 aborted 是不是我点的"这个判断留在语音层，
+  Record 页不需要维护额外标志位，也不用去纠结"用户点了停止但 aborted 晚到两秒"该怎么算
+- 决策：麦克风按钮的可访问性处理 ——
+  ① 用 `aria-pressed` 表达 toggle 语义（点一次开始、再点一次停止），
+  ② `aria-label` 描述**动作**而不是复述可见文案：未录音时"开始语音输入"、录音中"停止语音输入"
+  （读屏用户听到"停止语音输入，已选中"才推得出当前状态，听到"未选中"推不出来），
+  ③ 录音中的**可见文案用"停止"**，让它被可访问名包含 —— 语音控制用户照着屏幕上的字念得出来
+  （WCAG 2.5.3 Label in Name）；"正在录音"这层信息由脉冲动画 + 红色 + 方形停止图标承担，
+  ④ 禁用（浏览器不支持）时**不带 `aria-pressed`**：同时说"不可用"和"未选中/已选中"只会让读屏混乱
+- 验证：**场景 B**（临时在 `index.html` 注入 `delete window.SpeechRecognition` 模拟不支持）
+  由我在内置浏览器里跑通 —— 麦克风按钮存在且 `disabled`、`aria-pressed` 为 null（角色回到普通 button）、
+  外层 span 带 `title="当前浏览器不支持语音输入，请使用 Chrome 或 Edge"`、
+  文字输入 / 餐次按钮 / 解析按钮均正常、控制台 0 报错；测完那行注入已删除，
+  删掉后按钮立即恢复成可点的"开始语音输入"（走支持分支）
+- 验证：**场景 C**（编辑模式）无麦克风按钮、也无解析按钮 ✅
+- 验证：**场景 F 的可观察部分** —— 点麦克风进入录音状态后切到 Today（组件卸载触发 cleanup 调 `stop()`），
+  再切回 `/record` 时按钮已是初始态、无残留的"停止"状态、控制台 0 报错。
+  但"麦克风是否真的被释放"要看浏览器标签页的麦克风图标，那个我观察不到
+- 验证：**方案 C（主动取消不算错误）在真实浏览器里成立** —— 录音中点停止后按钮回到"开始语音输入"，
+  输入区下方没有出现任何提示条
+- 待人工：场景 A（Firefox 天然不支持）、场景 D / E / G（真实语音识别、权限被拒、追加到已有文字）
+  需要真实浏览器与麦克风，由人工在 Chrome 里跑；3.3 的三条已知限制无需验证

@@ -18,6 +18,7 @@ import { nowHhMm, todayIso } from '../services/date';
 import { clearDraft, loadDraft, makeEditDraftKey, makeNewDraftKey, saveDraft } from '../services/draft';
 import { applyFoodLibrary, recalcKcal, round1, scaleNutrition, validateItems } from '../services/nutrition';
 import type { AppliedItem } from '../services/nutrition';
+import { getErrorMessage, isSpeechSupported, startRecognition } from '../services/speech';
 
 type MealType = 'breakfast' | 'lunch' | 'dinner' | 'snack';
 
@@ -39,6 +40,26 @@ const MEAL_TYPES: ReadonlyArray<{ value: MealType; label: string }> = [
 ];
 
 const CELL_INPUT = 'rounded border border-slate-300 px-1 py-0.5 text-sm outline-none focus:border-blue-500';
+
+/** 麦克风图标。内联 SVG：项目不引图标库，更不该为两个图标引一个 */
+function MicIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0" />
+      <line x1="12" y1="18" x2="12" y2="21" />
+    </svg>
+  );
+}
+
+/** 录音中用它替换麦克风，配合 animate-pulse 表达"正在录音"（可见文案是"停止"） */
+function StopIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
 
 /** 来源标签：手改过营养值的行标成"手动"，和库/AI 区分开 */
 const SOURCE_BADGE: Record<AppliedItem['dataSource'], { text: string; className: string }> = {
@@ -166,6 +187,14 @@ export default function Record() {
   const [savedRowKeys, setSavedRowKeys] = useState<Record<string, boolean>>({});
   const [parsed, setParsed] = useState(false);
   const [draftRestored, setDraftRestored] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [speechNotice, setSpeechNotice] = useState<string | null>(null);
+  // 能力检测是同步的、且一次会话内不会变，所以只在首次渲染算一次
+  const [speechSupported] = useState(() => isSpeechSupported());
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  // 语音回调是在事件里触发的，闭包里的 parsed 会是旧值，所以用 ref 同步一份
+  const parsedRef = useRef(parsed);
+  parsedRef.current = parsed;
 
   const draftKey = isEditMode && editId !== null ? makeEditDraftKey(editId) : makeNewDraftKey();
   const previousEditIdRef = useRef<string | null>(editId);
@@ -358,6 +387,60 @@ export default function Record() {
   }, [isEditMode, text, rows, mealType, time, parsed]);
 
   const items = useMemo(() => rows.map((row) => row.item), [rows]);
+
+  /**
+   * 语音输入（只在新建模式渲染按钮，这里的状态机对所有情况都要收得住）。
+   * 退出的唯一出口是 onEnd —— 成功、失败、用户主动停止、卸载清理都会汇到它。
+   */
+  useEffect(
+    () => () => {
+      // 录着音切走页面时释放麦克风，避免后台继续占用
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (speechNotice === null) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSpeechNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [speechNotice]);
+
+  /** onEnd 与主动 stop 都会走到这里，重复调用无害 */
+  function finishListening(): void {
+    recognitionRef.current = null;
+    setListening(false);
+  }
+
+  function handleMicClick(): void {
+    if (listening) {
+      // 再点一次＝中止；随后的 onend 会走 finishListening
+      recognitionRef.current?.stop();
+      return;
+    }
+
+    setSpeechNotice(null);
+    setListening(true);
+    recognitionRef.current = startRecognition({
+      onResult: (text) => {
+        // 追加而不是覆盖：用户可能先手打了一段再补一段语音
+        setText((prev) => (prev.trim() === '' ? text : `${prev.trimEnd()} ${text}`));
+        if (parsedRef.current) {
+          // 已有卡片时不自动重新解析，保持"用户确认后才入库"的原则
+          setSpeechNotice('文本已更新，可重新解析');
+        }
+      },
+      onError: (error) => {
+        setSpeechNotice(getErrorMessage(error));
+      },
+      onEnd: () => {
+        finishListening();
+      },
+    });
+  }
 
   const errors = useMemo(() => {
     // validateItems 只认克数和营养值，空名字要靠页面自己挡：否则会存进一条没有名字的记录
@@ -648,7 +731,7 @@ export default function Record() {
               placeholder="例如：中午吃了200克鸡胸肉和150克米饭"
               className="w-full rounded-md border border-slate-300 bg-white p-3 text-sm outline-none focus:border-blue-500"
             />
-            <div className="mt-2 flex items-center gap-3">
+            <div className="mt-2 flex flex-wrap items-center gap-3">
               <button
                 type="button"
                 onClick={() => {
@@ -659,8 +742,57 @@ export default function Record() {
               >
                 {parsing ? '正在解析…' : '解析'}
               </button>
+              {speechSupported ? (
+                <button
+                  type="button"
+                  onClick={handleMicClick}
+                  // 可访问名描述"点下去会发生什么"（开始/停止），而不是复述可见文案：
+                  // 读屏用户听到"停止语音输入，已选中"比听到"未选中"更能推出当前状态
+                  aria-label={listening ? '停止语音输入' : '开始语音输入'}
+                  aria-pressed={listening}
+                  className={`flex items-center gap-1.5 rounded-md border px-4 py-1.5 text-sm font-medium ${
+                    listening
+                      ? 'animate-pulse border-red-300 bg-red-50 text-red-700'
+                      : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  {listening ? <StopIcon /> : <MicIcon />}
+                  {/* 可见文案用"停止"，被可访问名"停止语音输入"包含：语音控制用户
+                      照着屏幕上写的字念得出来（WCAG 2.5.3 Label in Name）。
+                      "正在录音"这层信息由脉冲动画 + 红色 + 方形停止图标承担 */}
+                  {listening ? '停止' : '语音输入'}
+                </button>
+              ) : (
+                // Chrome 里 disabled 的按钮不接收鼠标事件、也就不会显示 title，
+                // 所以把 title 挂到外层 span 上，"禁用"和"悬停提示"两个要求才能同时成立
+                <span title="当前浏览器不支持语音输入，请使用 Chrome 或 Edge">
+                  {/* 禁用的按钮不带 aria-pressed：同时说"不可用"和"未选中/已选中"只会让读屏混乱 */}
+                  <button
+                    type="button"
+                    disabled
+                    className="flex cursor-not-allowed items-center gap-1.5 rounded-md border border-slate-300 bg-white px-4 py-1.5 text-sm font-medium text-slate-400 opacity-60"
+                  >
+                    <MicIcon />
+                    语音输入
+                  </button>
+                </span>
+              )}
               {parsing && <span className="text-sm text-slate-500">正在解析…</span>}
             </div>
+
+            {speechNotice !== null && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                <span>{speechNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => setSpeechNotice(null)}
+                  aria-label="关闭提示"
+                  className="rounded border border-amber-300 bg-white px-2 py-0.5 text-xs text-amber-800"
+                >
+                  关闭
+                </button>
+              </div>
+            )}
           </div>
         </>
       )}
