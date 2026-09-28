@@ -3,11 +3,12 @@ import type { FormEvent } from 'react';
 
 import { addFood } from '../db/repo';
 import type { FoodLibraryItem } from '../db/schema';
+import { recalcKcal } from '../services/nutrition';
 
 interface SaveAsFoodFormProps {
   defaultName: string;
   /** 每 100g 的营养值，作为表单默认值 */
-  defaultPer100g: { proteinG: number; carbG: number; fatG: number; kcal: number };
+  defaultPer100g: { proteinG: number; carbG: number; fatG: number };
   onSaved: (food: FoodLibraryItem) => void;
   onCancel: () => void;
 }
@@ -27,9 +28,14 @@ export default function SaveAsFoodForm({ defaultName, defaultPer100g, onSaved, o
   const [proteinG, setProteinG] = useState(String(defaultPer100g.proteinG));
   const [carbG, setCarbG] = useState(String(defaultPer100g.carbG));
   const [fatG, setFatG] = useState(String(defaultPer100g.fatG));
-  const [kcal, setKcal] = useState(String(defaultPer100g.kcal));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // 热量是 P/F/C 的派生值：给输入框就能和营养值打架，方案 2 下不允许独立存
+  const proteinValue = toNumber(proteinG);
+  const carbValue = toNumber(carbG);
+  const fatValue = toNumber(fatG);
+  const kcal = recalcKcal(proteinValue, carbValue, fatValue);
 
   async function handleSubmit(event: FormEvent): Promise<void> {
     event.preventDefault();
@@ -51,10 +57,10 @@ export default function SaveAsFoodForm({ defaultName, defaultPer100g, onSaved, o
           .filter((alias) => alias !== ''),
         perAmount: 100,
         perUnit: 'g',
-        proteinG: toNumber(proteinG),
-        carbG: toNumber(carbG),
-        fatG: toNumber(fatG),
-        kcal: toNumber(kcal),
+        proteinG: proteinValue,
+        carbG: carbValue,
+        fatG: fatValue,
+        kcal,
       });
       onSaved(food);
     } catch (cause) {
@@ -98,7 +104,6 @@ export default function SaveAsFoodForm({ defaultName, defaultPer100g, onSaved, o
           ['蛋白质', proteinG, setProteinG],
           ['碳水', carbG, setCarbG],
           ['脂肪', fatG, setFatG],
-          ['热量', kcal, setKcal],
         ] as const
       ).map(([label, value, setter]) => (
         <label key={label} className="flex flex-col gap-1 text-xs text-slate-600">
@@ -111,6 +116,13 @@ export default function SaveAsFoodForm({ defaultName, defaultPer100g, onSaved, o
           />
         </label>
       ))}
+
+      <div className="flex flex-col gap-1 text-xs text-slate-600">
+        热量/100g
+        <span className="px-2 py-1 text-sm text-slate-700">
+          {kcal} <span className="text-xs text-slate-400">kcal</span>
+        </span>
+      </div>
 
       <div className="flex items-center gap-2">
         <button

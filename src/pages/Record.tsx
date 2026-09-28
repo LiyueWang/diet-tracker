@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
 import SaveAsFoodForm from '../components/SaveAsFoodForm';
@@ -15,7 +15,8 @@ import type { FoodItemInput } from '../db/repo';
 import type { FoodItem, FoodLibraryItem } from '../db/schema';
 import { parseText } from '../services/ai';
 import { nowHhMm, todayIso } from '../services/date';
-import { applyFoodLibrary, round1, validateItems } from '../services/nutrition';
+import { clearDraft, loadDraft, makeEditDraftKey, makeNewDraftKey, saveDraft } from '../services/draft';
+import { applyFoodLibrary, recalcKcal, round1, scaleNutrition, validateItems } from '../services/nutrition';
 import type { AppliedItem } from '../services/nutrition';
 
 type MealType = 'breakfast' | 'lunch' | 'dinner' | 'snack';
@@ -38,6 +39,13 @@ const MEAL_TYPES: ReadonlyArray<{ value: MealType; label: string }> = [
 ];
 
 const CELL_INPUT = 'rounded border border-slate-300 px-1 py-0.5 text-sm outline-none focus:border-blue-500';
+
+/** 来源标签：手改过营养值的行标成"手动"，和库/AI 区分开 */
+const SOURCE_BADGE: Record<AppliedItem['dataSource'], { text: string; className: string }> = {
+  food_library: { text: '库', className: 'bg-green-100 text-green-700' },
+  ai_estimate: { text: 'AI', className: 'bg-amber-100 text-amber-700' },
+  manual: { text: '手动', className: 'bg-slate-200 text-slate-700' },
+};
 
 /** 按当前时间猜默认餐次：<10 早餐，<15 午餐，<21 晚餐，其余加餐 */
 function guessMealType(now: Date): MealType {
@@ -98,7 +106,8 @@ function toFoodItemInput(item: AppliedItem): FoodItemInput {
  * 已保存的 FoodItem → 确认卡片用的 AppliedItem。
  * estimated 只能拿存下来的数值充当：库里没有保留当初 AI 的原始估算，
  * 这个字段只在"库行失去匹配后退回估算"时才被读到。
- * dataSource 为 manual 的行目前没有写入方，这里按 AI 估算处理。
+ * dataSource 三态（food_library / ai_estimate / manual）原样带回，
+ * 用户手改过的行不能被重新编辑时又降级成 AI 估算。
  */
 function toAppliedItem(item: FoodItem): AppliedItem {
   return {
@@ -117,25 +126,24 @@ function toAppliedItem(item: FoodItem): AppliedItem {
     carbG: item.carbG,
     fatG: item.fatG,
     kcal: item.kcal,
-    dataSource: item.dataSource === 'food_library' ? 'food_library' : 'ai_estimate',
+    dataSource: item.dataSource,
     ...(item.foodLibraryId ? { foodLibraryId: item.foodLibraryId } : {}),
     needsWeight: item.weightG === null,
   };
 }
 
 /** 「存为常用」表单要的是每 100g 的值，而卡片上的数值是当前克数的合计，这里换算回去 */
-function toPer100g(item: AppliedItem): { proteinG: number; carbG: number; fatG: number; kcal: number } {
+function toPer100g(item: AppliedItem): { proteinG: number; carbG: number; fatG: number } {
   if (item.weightG !== null && item.weightG > 0) {
     const factor = 100 / item.weightG;
     return {
       proteinG: round1(item.proteinG * factor),
       carbG: round1(item.carbG * factor),
       fatG: round1(item.fatG * factor),
-      kcal: round1(item.kcal * factor),
     };
   }
   // 没有克数就没法换算，原样带入让用户自己核对
-  return { proteinG: item.proteinG, carbG: item.carbG, fatG: item.fatG, kcal: item.kcal };
+  return { proteinG: item.proteinG, carbG: item.carbG, fatG: item.fatG };
 }
 
 export default function Record() {
@@ -156,6 +164,22 @@ export default function Record() {
   const [error, setError] = useState<string | null>(null);
   const [openFormKey, setOpenFormKey] = useState<string | null>(null);
   const [savedRowKeys, setSavedRowKeys] = useState<Record<string, boolean>>({});
+  const [parsed, setParsed] = useState(false);
+  const [draftRestored, setDraftRestored] = useState(false);
+
+  const draftKey = isEditMode && editId !== null ? makeEditDraftKey(editId) : makeNewDraftKey();
+  const previousEditIdRef = useRef<string | null>(editId);
+  /**
+   * 模式切换那一轮要跳过草稿写入：清空表单是"模式切换"造成的，
+   * 不是用户改内容，写下去会覆盖用户切到编辑页之前留下的草稿。
+   */
+  const skipNextDraftWriteRef = useRef(false);
+  /**
+   * 本组件实例是否"拥有"当前这份新建草稿（写过或恢复过）。
+   * 只有拥有者才有资格在表单被清空时删草稿 —— 否则从编辑模式切回来时会误删
+   * 用户之前存下的 draft:record:new。
+   */
+  const ownsDraftRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,6 +248,115 @@ export default function Record() {
     };
   }, [editId]);
 
+  /** 恢复/丢弃草稿和"取消"都要回到初始状态，集中在一处免得漏字段 */
+  function resetForm(): void {
+    setText('');
+    setRows([]);
+    setMealType(guessMealType(new Date()));
+    setTime(nowHhMm());
+    setParsed(false);
+    setError(null);
+    setOpenFormKey(null);
+    setSavedRowKeys({});
+  }
+
+  /**
+   * 从编辑模式切到新建模式时清空表单。
+   * 这两种模式共用同一个组件实例（只是 search params 不同），不清的话
+   * 上一条记录的数据会留在"新建"表单里，一点保存就多出一条重复记录。
+   * 初次挂载不触发：previous 初值就是当前 editId。
+   */
+  useEffect(() => {
+    const previousEditId = previousEditIdRef.current;
+    previousEditIdRef.current = editId;
+    if (previousEditId !== null && editId === null) {
+      // 这次清空是模式切换造成的：既不写草稿，也不删草稿，把用户原来的草稿原样留着
+      skipNextDraftWriteRef.current = true;
+      ownsDraftRef.current = false;
+      resetForm();
+      setDraftRestored(false);
+
+      // 静默恢复，不弹提示条：从编辑页切回来的用户刚从上下文里出来，
+      // 表单里原样出现自己刚才写的东西是自然预期；提示条是给"从外部进入、
+      // 不知道有草稿"的用户看的。编辑模式挂载时已清掉编辑草稿，
+      // 所以这里读到的只可能是新建模式那一份。
+      const draft = loadDraft(makeNewDraftKey());
+      if (draft) {
+        setText(draft.rawText);
+        setRows(draft.items.map((item) => ({ key: crypto.randomUUID(), item })));
+        setMealType(draft.mealType);
+        setTime(draft.time);
+        setParsed(draft.parsed);
+        // 恢复之后这份草稿归本次表单所有，用户再清空表单时应该连草稿一起清掉
+        ownsDraftRef.current = true;
+      }
+    }
+  }, [editId]);
+
+  /**
+   * 挂载时恢复草稿。
+   * 编辑模式故意不读草稿：那种情况下数据库才是唯一事实来源，
+   * 但要把可能残留的编辑草稿清掉，免得以后版本误读到旧内容。
+   */
+  useEffect(() => {
+    if (editId !== null) {
+      clearDraft(makeEditDraftKey(editId));
+      return;
+    }
+    const draft = loadDraft(makeNewDraftKey());
+    if (!draft) {
+      return;
+    }
+    setText(draft.rawText);
+    setRows(draft.items.map((item) => ({ key: crypto.randomUUID(), item })));
+    setMealType(draft.mealType);
+    setTime(draft.time);
+    setParsed(draft.parsed);
+    // 恢复之后这份草稿就归本次表单所有：用户清空表单时应该连草稿一起清掉
+    ownsDraftRef.current = true;
+    setDraftRestored(true);
+    // 只在挂载时跑一次：这是"进入页面时恢复一次"的语义，后续变化由写入 effect 负责
+  }, []);
+
+  /**
+   * 草稿落盘（防抖 500ms）。
+   * 用 effect 的 cleanup 当防抖：每次内容变化都取消上一个定时器，
+   * 组件卸载时也会清掉未触发的定时器，不会写入过期数据。
+   * 本阶段只做新建模式草稿（编辑模式草稿优先级低，见 AGENTS.md 开发日志）。
+   */
+  useEffect(() => {
+    if (isEditMode) {
+      return;
+    }
+    if (skipNextDraftWriteRef.current) {
+      // 模式切换那一轮直接跳过：保住用户切到编辑页之前的草稿
+      skipNextDraftWriteRef.current = false;
+      return;
+    }
+    const hasContent = text.trim() !== '' || rows.length > 0;
+    if (!hasContent) {
+      // 空表单不写草稿，否则光是打开页面再回来就会弹"已恢复上次未保存的内容"
+      // 但只有"自己写过/恢复过"的草稿才清，避免把别人的草稿删掉
+      if (ownsDraftRef.current) {
+        clearDraft(makeNewDraftKey());
+        ownsDraftRef.current = false;
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      saveDraft(makeNewDraftKey(), {
+        rawText: text,
+        items: rows.map((row) => row.item),
+        mealType,
+        time,
+        parsed,
+        savedAt: new Date().toISOString(),
+      });
+      ownsDraftRef.current = true;
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [isEditMode, text, rows, mealType, time, parsed]);
+
   const items = useMemo(() => rows.map((row) => row.item), [rows]);
 
   const errors = useMemo(() => {
@@ -255,22 +388,45 @@ export default function Record() {
   }
 
   /**
-   * 改克数：命中食物库的行按库里每 100g 的数据重算（否则"库"这个标签就是假的）；
-   * AI 估算的行只改克数，不覆盖用户手工改过的营养值。
+   * 克数变化分三条路径：
+   * A1 原本就有克数、改成新克数 —— 以当前 P/F/C 等比缩放，dataSource 不变
+   * A2 原本没有克数、补上克数 —— 命中食物库的按库里每 100g 重算；未命中的只更新克数
+   * A3 清空克数 —— 不缩放，克数置空后由校验拦截（保存按钮禁用）
+   * 三条路径的 kcal 都由 recalcKcal 从 P/F/C 派生，不单独缩放热量。
    */
   function handleWeightChange(row: EditableRow, raw: string): void {
     const next = parseWeightInput(raw);
     if (next === undefined) {
       return;
     }
-    if (next !== null && row.item.foodLibraryId) {
+
+    if (row.item.weightG === null && next !== null && row.item.foodLibraryId) {
       const [recomputed] = applyFoodLibrary([{ ...row.item, weightG: next }], library);
       if (recomputed) {
         patchRow(row.key, recomputed);
         return;
       }
     }
-    patchRow(row.key, { weightG: next });
+
+    const scaled = scaleNutrition(row.item, row.item.weightG, next);
+    patchRow(row.key, { weightG: next, ...scaled });
+  }
+
+  /**
+   * 改 P/F/C（规则 B）：只动被改的那个字段，热量由三者重算，
+   * 来源标成 manual —— 数值已经不再是食物库或 AI 给的原始值了。
+   */
+  function handleNutritionChange(row: EditableRow, field: 'proteinG' | 'carbG' | 'fatG', raw: string): void {
+    const parsed = parseNutritionInput(raw);
+    if (parsed === undefined) {
+      return;
+    }
+    const next = { ...row.item, [field]: parsed };
+    patchRow(row.key, {
+      [field]: parsed,
+      kcal: recalcKcal(next.proteinG, next.carbG, next.fatG),
+      dataSource: 'manual',
+    });
   }
 
   async function handleParse(): Promise<void> {
@@ -288,10 +444,12 @@ export default function Record() {
       const result = await parseText(trimmed);
       if (result.items.length === 0) {
         setRows([]);
+        setParsed(false);
         setError('没有识别到任何食物，换个说法再试');
         return;
       }
       setRows(applyFoodLibrary(result.items, library).map(toRow));
+      setParsed(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -325,15 +483,22 @@ export default function Record() {
   }
 
   function handleCancel(): void {
+    clearDraft(draftKey);
+    ownsDraftRef.current = false;
     // 编辑模式直接离开，不要留下"看起来取消了其实没保存"的中间状态
     if (isEditMode) {
       navigate('/');
       return;
     }
-    setRows([]);
-    setError(null);
-    setOpenFormKey(null);
-    setSavedRowKeys({});
+    resetForm();
+  }
+
+  /** 提示条上的「丢弃草稿」：清掉暂存并把表单恢复到初始状态 */
+  function handleDiscardDraft(): void {
+    clearDraft(draftKey);
+    ownsDraftRef.current = false;
+    resetForm();
+    setDraftRestored(false);
   }
 
   function handleFoodSaved(row: EditableRow, food: FoodLibraryItem): void {
@@ -356,6 +521,8 @@ export default function Record() {
         // date 不传：本阶段不支持跨天移动记录
         await updateMeal(editId, { mealType, time });
         await replaceMealItems(editId, items.map(toFoodItemInput));
+        clearDraft(draftKey);
+        ownsDraftRef.current = false;
         navigate('/', { state: { savedAt: Date.now(), kind: 'updated' } });
         return;
       }
@@ -372,6 +539,9 @@ export default function Record() {
       setRows([]);
       setText('');
       setSavedRowKeys({});
+      setParsed(false);
+      clearDraft(draftKey);
+      ownsDraftRef.current = false;
       // 跳回今日汇总；带上 state 让 Today 能提示"已保存"
       navigate('/', { state: { savedAt: Date.now(), kind: 'created' } });
     } catch (cause) {
@@ -436,6 +606,26 @@ export default function Record() {
   return (
     <section className="space-y-4">
       <h1 className="text-xl font-semibold">{isEditMode ? '编辑记录' : '记录饮食'}</h1>
+
+      {draftRestored && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+          <span>已恢复上次未保存的内容</span>
+          <button
+            type="button"
+            onClick={() => setDraftRestored(false)}
+            className="rounded border border-amber-300 bg-white px-2 py-0.5 text-xs text-amber-800"
+          >
+            继续编辑
+          </button>
+          <button
+            type="button"
+            onClick={handleDiscardDraft}
+            className="rounded border border-amber-300 bg-white px-2 py-0.5 text-xs text-amber-800"
+          >
+            丢弃草稿
+          </button>
+        </div>
+      )}
 
       {isEditMode ? (
         <div className="rounded-lg border border-slate-200 bg-white p-4">
@@ -510,6 +700,9 @@ export default function Record() {
                     </td>
                     <td className="py-2 pr-2">
                       <input
+                        type="number"
+                        min={1}
+                        step="any"
                         className={`${CELL_INPUT} w-16 ${weightMissing ? 'border-red-500 bg-red-50' : ''}`}
                         value={item.weightG ?? ''}
                         onChange={(event) => handleWeightChange(row, event.target.value)}
@@ -522,32 +715,27 @@ export default function Record() {
                         ['蛋白质', item.proteinG, 'proteinG'],
                         ['碳水', item.carbG, 'carbG'],
                         ['脂肪', item.fatG, 'fatG'],
-                        ['热量', item.kcal, 'kcal'],
                       ] as const
                     ).map(([label, value, field]) => (
                       <td key={field} className="py-2 pr-2">
                         <input
                           className={`${CELL_INPUT} w-16`}
                           value={value}
-                          onChange={(event) => {
-                            const parsed = parseNutritionInput(event.target.value);
-                            if (parsed !== undefined) {
-                              patchRow(row.key, { [field]: parsed });
-                            }
-                          }}
+                          onChange={(event) => handleNutritionChange(row, field, event.target.value)}
                           aria-label={label}
                         />
                       </td>
                     ))}
                     <td className="py-2 pr-2">
+                      {/* 热量是 P/F/C 的派生值，只读展示：给它输入框只会和营养值互相打架 */}
+                      <span className="text-sm text-slate-700">{item.kcal}</span>
+                      <span className="ml-1 text-xs text-slate-400">kcal</span>
+                    </td>
+                    <td className="py-2 pr-2">
                       <span
-                        className={`rounded px-1.5 py-0.5 text-xs font-medium ${
-                          item.dataSource === 'food_library'
-                            ? 'bg-green-100 text-green-700'
-                            : 'bg-amber-100 text-amber-700'
-                        }`}
+                        className={`rounded px-1.5 py-0.5 text-xs font-medium ${SOURCE_BADGE[item.dataSource].className}`}
                       >
-                        {item.dataSource === 'food_library' ? '库' : 'AI'}
+                        {SOURCE_BADGE[item.dataSource].text}
                       </span>
                     </td>
                     <td className="py-2">

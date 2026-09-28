@@ -8,7 +8,7 @@ export interface AppliedItem extends ParsedItem {
   carbG: number;
   fatG: number;
   kcal: number;
-  dataSource: 'food_library' | 'ai_estimate';
+  dataSource: 'food_library' | 'ai_estimate' | 'manual';
   foodLibraryId?: string;
   /** 克数缺失：营养值只是临时占位，保存前必须补齐 */
   needsWeight: boolean;
@@ -50,18 +50,31 @@ function matchFood(name: string, library: FoodLibraryItem[]): FoodLibraryItem | 
   });
 }
 
+/**
+ * 用 AI 估算填充营养值。kcal 一律由 P/F/C 派生（方案 2：kcal 不独立存储），
+ * 不直接采用模型返回的 estimated.kcal —— 否则系统里会有两条 kcal 来源，
+ * 改一次克数就会出现"热量和营养值对不上"的情况。
+ */
+function fromEstimated(item: ParsedItem): { proteinG: number; carbG: number; fatG: number; kcal: number } {
+  const { proteinG, carbG, fatG } = item.estimated;
+  return { proteinG, carbG, fatG, kcal: recalcKcal(proteinG, carbG, fatG) };
+}
+
 export function applyFoodLibrary(items: ParsedItem[], library: FoodLibraryItem[]): AppliedItem[] {
   return items.map((item) => {
     const matched = matchFood(item.name, library);
 
     if (matched && item.weightG !== null) {
       const ratio = item.weightG / matched.perAmount;
+      const proteinG = round1(matched.proteinG * ratio);
+      const carbG = round1(matched.carbG * ratio);
+      const fatG = round1(matched.fatG * ratio);
       return {
         ...item,
-        proteinG: round1(matched.proteinG * ratio),
-        carbG: round1(matched.carbG * ratio),
-        fatG: round1(matched.fatG * ratio),
-        kcal: round1(matched.kcal * ratio),
+        proteinG,
+        carbG,
+        fatG,
+        kcal: recalcKcal(proteinG, carbG, fatG),
         dataSource: 'food_library',
         foodLibraryId: matched.id,
         needsWeight: false,
@@ -73,7 +86,7 @@ export function applyFoodLibrary(items: ParsedItem[], library: FoodLibraryItem[]
       // 用户在确认卡片里补上克数后就能按食物库重算。
       return {
         ...item,
-        ...item.estimated,
+        ...fromEstimated(item),
         dataSource: 'food_library',
         foodLibraryId: matched.id,
         needsWeight: true,
@@ -82,16 +95,55 @@ export function applyFoodLibrary(items: ParsedItem[], library: FoodLibraryItem[]
 
     return {
       ...item,
-      ...item.estimated,
+      ...fromEstimated(item),
       dataSource: 'ai_estimate',
       needsWeight: item.weightG === null,
     } satisfies AppliedItem;
   });
 }
 
-export function calcKcalFromPFC(proteinG: number, carbG: number, fatG: number): number {
-  // 公式本身是 4/4/9，外面套一层 round1 只是抹掉二进制浮点尾巴（3.6*9 = 32.400000000000006）
+/** 热量 = 蛋白质*4 + 碳水*4 + 脂肪*9 */
+export function recalcKcal(proteinG: number, carbG: number, fatG: number): number {
+  // 外面套一层 round1 只是抹掉二进制浮点尾巴（3.6*9 = 32.400000000000006）
   return round1(proteinG * 4 + carbG * 4 + fatG * 9);
+}
+
+/** 旧名字保留，避免破坏既有调用；新代码统一用 recalcKcal */
+export function calcKcalFromPFC(proteinG: number, carbG: number, fatG: number): number {
+  return recalcKcal(proteinG, carbG, fatG);
+}
+
+export interface NutritionBase {
+  proteinG: number;
+  carbG: number;
+  fatG: number;
+}
+
+/**
+ * 按新旧克数等比缩放营养值。
+ * kcal 用 recalcKcal 从缩放后的 P/F/C 重算，而不是 base.kcal * factor：
+ * 后者会把上一轮的四舍五入误差一路带下去，改几次克数后热量就和 P/F/C 对不上了。
+ * 没有旧克数（null）或旧克数为 0 时无法等比，原值返回，是否拦保存由调用方决定。
+ */
+export function scaleNutrition(
+  base: NutritionBase,
+  oldWeightG: number | null,
+  newWeightG: number | null,
+): { proteinG: number; carbG: number; fatG: number; kcal: number } {
+  if (oldWeightG === null || newWeightG === null || oldWeightG <= 0) {
+    return {
+      proteinG: base.proteinG,
+      carbG: base.carbG,
+      fatG: base.fatG,
+      kcal: recalcKcal(base.proteinG, base.carbG, base.fatG),
+    };
+  }
+
+  const factor = newWeightG / oldWeightG;
+  const proteinG = round1(base.proteinG * factor);
+  const carbG = round1(base.carbG * factor);
+  const fatG = round1(base.fatG * factor);
+  return { proteinG, carbG, fatG, kcal: recalcKcal(proteinG, carbG, fatG) };
 }
 
 export function validateItems(items: AppliedItem[]): string[] {
