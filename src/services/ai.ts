@@ -37,13 +37,23 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
       body: JSON.stringify(body),
     });
   } catch (error) {
-    // 代理没启动时 fetch 只会抛 "Failed to fetch"，调用方拿不到任何可行动的信息
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`无法连接本地 AI 代理（${path}）：${detail}`, { cause: error });
+    // 请求根本没发出去：Vite 都没起，或者网络中断。
+    // 原始报错（"Failed to fetch" 之类）留在 cause 里备查，给用户看的是能行动的那句。
+    throw new Error('无法连接本地 AI 代理，请确认 npm run dev 已启动', { cause: error });
   }
 
   if (response.status === 429) {
     throw new Error(DAILY_LIMIT_MESSAGE);
+  }
+
+  // 502/503 是 Vite 代理在"后端进程没起或崩了"时返回的，504 是代理连上了但上游超时。
+  // 这三种要和下面的通用分支分开报，否则用户只看到"AI 代理返回 HTTP 502"，
+  // 不知道该去启哪个服务、还是该重试。
+  if (response.status === 502 || response.status === 503) {
+    throw new Error('AI 代理未就绪，请确认 server 已启动');
+  }
+  if (response.status === 504) {
+    throw new Error('AI 代理响应超时，请重试');
   }
 
   if (!response.ok) {
