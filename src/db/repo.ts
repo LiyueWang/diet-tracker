@@ -222,6 +222,13 @@ export async function addFood(input: FoodLibraryInput): Promise<FoodLibraryItem>
   });
 }
 
+/**
+ * 按 name 索引顺序返回（**字符码点序**，不是拼音序）。
+ *
+ * ⚠️ 这个顺序不只是显示用：`src/services/nutrition.ts` 的 `matchFood` 取的是"数组里第一条命中的"，
+ * 所以改这里的 `orderBy` 会**悄悄改掉食物库匹配的优先级**（同名或别名冲突时命中哪一条）。
+ * 页面上想按拼音展示（中文用户的直觉），请在页面层对返回值再排一次 —— 食物库管理页就是这么做的。
+ */
 export async function listFoodLibrary(): Promise<FoodLibraryItem[]> {
   return withRepoContext('listFoodLibrary', () => db.foodLibrary.orderBy('name').toArray());
 }

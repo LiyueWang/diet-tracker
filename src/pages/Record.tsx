@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
-import SaveAsFoodForm from '../components/SaveAsFoodForm';
+import FoodLibraryForm from '../components/FoodLibraryForm';
 import {
+  addFood,
   addFoodItems,
   createMeal,
   getItemsByMealId,
   getMealById,
   listFoodLibrary,
+  listSupplements,
   replaceMealItems,
   updateMeal,
 } from '../db/repo';
 import type { FoodItemInput } from '../db/repo';
-import type { FoodItem, FoodLibraryItem } from '../db/schema';
+import type { FoodItem, FoodLibraryItem, SupplementPlan } from '../db/schema';
 import { parseText } from '../services/ai';
 import { nowHhMm, todayIso } from '../services/date';
 import { clearDraft, loadDraft, makeEditDraftKey, makeNewDraftKey, saveDraft } from '../services/draft';
@@ -117,6 +119,9 @@ function toFoodItemInput(item: AppliedItem): FoodItemInput {
   if (item.foodLibraryId) {
     input.foodLibraryId = item.foodLibraryId;
   }
+  if (item.supplementPlanId) {
+    input.supplementPlanId = item.supplementPlanId;
+  }
   if (item.dataSource === 'ai_estimate') {
     input.aiConfidence = item.confidence;
   }
@@ -149,6 +154,7 @@ function toAppliedItem(item: FoodItem): AppliedItem {
     kcal: item.kcal,
     dataSource: item.dataSource,
     ...(item.foodLibraryId ? { foodLibraryId: item.foodLibraryId } : {}),
+    ...(item.supplementPlanId ? { supplementPlanId: item.supplementPlanId } : {}),
     needsWeight: item.weightG === null,
   };
 }
@@ -178,6 +184,7 @@ export default function Record() {
   const [text, setText] = useState('');
   const [rows, setRows] = useState<EditableRow[]>([]);
   const [library, setLibrary] = useState<FoodLibraryItem[]>([]);
+  const [supplements, setSupplements] = useState<SupplementPlan[]>([]);
   const [parsing, setParsing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loadingEdit, setLoadingEdit] = useState(isEditMode);
@@ -212,10 +219,12 @@ export default function Record() {
 
   useEffect(() => {
     let cancelled = false;
-    listFoodLibrary()
-      .then((foods) => {
+    Promise.all([listFoodLibrary(), listSupplements()])
+      .then(([foods, plans]) => {
         if (!cancelled) {
           setLibrary(foods);
+          // 快捷添加只列启用中的补剂：停用的那些不该出现在操作入口里
+          setSupplements(plans.filter((plan) => plan.active === 1));
         }
       })
       .catch((cause: unknown) => {
@@ -592,6 +601,36 @@ export default function Record() {
     setOpenFormKey(null);
   }
 
+  /**
+   * 快捷添加补剂：不走 AI 解析，直接把方案里那一份的营养值变成一条卡片条目。
+   * 方案的 P/F/C 本来就对应 defaultAmountG 这一份，所以不换算；用户之后改克数会走规则 A 等比缩放。
+   */
+  function handleQuickAddSupplement(plan: SupplementPlan): void {
+    setRows((prev) => [
+      ...prev,
+      toRow({
+        name: plan.name,
+        weightG: plan.defaultAmountG,
+        quantityDesc: `${plan.defaultAmountG}g`,
+        itemType: 'supplement',
+        estimated: { proteinG: plan.proteinG, carbG: plan.carbG, fatG: plan.fatG, kcal: plan.kcal },
+        // 不是模型估算，给满置信度；dataSource 是 food_library，这个值不会被写进库
+        confidence: 1,
+        proteinG: plan.proteinG,
+        carbG: plan.carbG,
+        fatG: plan.fatG,
+        // 方案 2：kcal 由 P/F/F 派生，不用方案里存的 kcal
+        kcal: recalcKcal(plan.proteinG, plan.carbG, plan.fatG),
+        // 复用 food_library 标签表示"数据来自已存储的条目"，不新增枚举值
+        dataSource: 'food_library',
+        supplementPlanId: plan.id,
+        needsWeight: false,
+      }),
+    ]);
+    // 点一下就相当于"已经解析出结果"，草稿与卡片状态都按已解析处理
+    setParsed(true);
+  }
+
   async function handleSave(): Promise<void> {
     if (errors.length > 0) {
       return;
@@ -793,6 +832,29 @@ export default function Record() {
                 </button>
               </div>
             )}
+
+            {/* 快捷添加只在加餐模式下出现：补剂基本都算加餐，其他餐次显示它只会误导 */}
+            {mealType === 'snack' && (
+              <div className="mt-3 rounded-md border border-slate-200 bg-white p-3">
+                <p className="text-xs font-medium text-slate-600">快捷添加补剂</p>
+                {supplements.length === 0 ? (
+                  <p className="mt-1 text-xs text-slate-400">还没有启用的补剂，去「补剂」页新增</p>
+                ) : (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {supplements.map((plan) => (
+                      <button
+                        key={plan.id}
+                        type="button"
+                        onClick={() => handleQuickAddSupplement(plan)}
+                        className="rounded-md border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 hover:bg-slate-100"
+                      >
+                        {plan.name} {plan.defaultAmountG}g
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </>
       )}
@@ -901,11 +963,15 @@ export default function Record() {
                   return (
                     <tr>
                       <td colSpan={8} className="pt-1">
-                        <SaveAsFoodForm
-                          defaultName={row.item.name}
-                          defaultPer100g={toPer100g(row.item)}
-                          onSaved={(food) => handleFoodSaved(row, food)}
+                        <FoodLibraryForm
+                          // 卡片上的数字是"当前克数"的合计，表单要的是"每份量"（默认 100g），这里换算回去
+                          initialValue={{ name: row.item.name, ...toPer100g(row.item) }}
+                          onSubmit={async (value) => {
+                            const food = await addFood(value);
+                            handleFoodSaved(row, food);
+                          }}
                           onCancel={() => setOpenFormKey(null)}
+                          submitLabel="存入食物库"
                         />
                       </td>
                     </tr>

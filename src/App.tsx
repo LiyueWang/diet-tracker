@@ -5,6 +5,7 @@ import FoodLibrary from './pages/FoodLibrary';
 import Record from './pages/Record';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
+import Supplements from './pages/Supplements';
 import Today from './pages/Today';
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
           <Route path="/" element={<Today />} />
           <Route path="/record" element={<Record />} />
           <Route path="/library" element={<FoodLibrary />} />
+          <Route path="/supplements" element={<Supplements />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>

@@ -5,6 +5,7 @@ const NAV_ITEMS: ReadonlyArray<{ to: string; label: string; end?: boolean }> = [
   { to: '/', label: '今日', end: true },
   { to: '/record', label: '记录' },
   { to: '/library', label: '食物库' },
+  { to: '/supplements', label: '补剂' },
   { to: '/reports', label: '报告' },
   { to: '/settings', label: '设置' },
 ];

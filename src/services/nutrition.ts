@@ -10,6 +10,8 @@ export interface AppliedItem extends ParsedItem {
   kcal: number;
   dataSource: 'food_library' | 'ai_estimate' | 'manual';
   foodLibraryId?: string;
+  /** 补剂条目的来源方案 id（Record 页点"快捷添加补剂"时写入） */
+  supplementPlanId?: string;
   /** 克数缺失：营养值只是临时占位，保存前必须补齐 */
   needsWeight: boolean;
 }
@@ -27,6 +29,11 @@ export function round1(value: number): number {
 /**
  * 匹配优先级：name 完全相等 > aliases 包含 name > 双向模糊包含。
  * 同级取食物库中靠前的一条，避免顺序不稳定导致同一输入命中不同结果。
+ *
+ * ⚠️ 这里的"靠前"直接依赖传进来的 `library` 数组顺序，而它来自
+ * `repo.listFoodLibrary()` 的 `orderBy('name')`（字符码点序）。
+ * 所以：改那边的排序 = 改这里的匹配结果。要按拼音显示请在展示层排序，
+ * 不要把排过序的数组喂给本函数 —— 调用方（Record 页）传的就是库的原始顺序。
  */
 function matchFood(name: string, library: FoodLibraryItem[]): FoodLibraryItem | undefined {
   const key = normalizeName(name);
