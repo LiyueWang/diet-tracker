@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
+import TargetBar from '../components/TargetBar';
 import {
   deleteItemsByMealId,
   getActivePlan,
@@ -50,29 +51,6 @@ function sumItems(items: FoodItem[]): Totals {
       kcal: round1(acc.kcal + item.kcal),
     }),
     ZERO_TOTALS,
-  );
-}
-
-/** 目标进度条：超额时换成红色，比继续拉满蓝色更能说明问题 */
-function TargetBar({ label, value, target, unit }: { label: string; value: number; target: number; unit: string }) {
-  const percent = target > 0 ? Math.round((value / target) * 100) : 0;
-  const width = Math.min(100, Math.max(0, percent));
-  return (
-    <div>
-      <div className="flex justify-between text-xs text-slate-600">
-        <span>{label}</span>
-        <span>
-          {value} / {target} {unit}（{percent}%）
-        </span>
-      </div>
-      <div className="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-200">
-        {/* 宽度是运行时算出来的，Tailwind 的静态类名表达不了，只能走内联 style */}
-        <div
-          className={`h-2 rounded-full ${value > target ? 'bg-red-500' : 'bg-blue-500'}`}
-          style={{ width: `${width}%` }}
-        />
-      </div>
-    </div>
   );
 }
 

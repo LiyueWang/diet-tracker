@@ -1,6 +1,7 @@
 import { Route, Routes } from 'react-router-dom';
 
 import NavBar from './components/NavBar';
+import Analysis from './pages/Analysis';
 import FoodLibrary from './pages/FoodLibrary';
 import Record from './pages/Record';
 import Reports from './pages/Reports';
@@ -19,6 +20,7 @@ export default function App() {
           <Route path="/library" element={<FoodLibrary />} />
           <Route path="/supplements" element={<Supplements />} />
           <Route path="/reports" element={<Reports />} />
+          <Route path="/analysis" element={<Analysis />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

@@ -67,9 +67,12 @@ app.post('/api/ai/parse', async (req, res) => {
 });
 
 app.post('/api/ai/report', async (req, res) => {
-  const body = req.body as { payload?: unknown; type?: unknown } | undefined;
+  const body = req.body as { payload?: unknown; type?: unknown; skipCache?: unknown } | undefined;
   const type = body?.type;
   const payload = body?.payload;
+  // 「重新生成」要的是一段新文案，不是"再走一遍流程"，所以前端会带 skipCache。
+  // 只跳过"读"，写缓存照旧：新结果覆盖旧的，下次被动请求（重挂载、切 Tab 切回来）命中新的那份。
+  const skipCache = body?.skipCache === true;
 
   if (type !== 'daily' && type !== 'weekly') {
     res.status(400).json({ error: 'type must be daily or weekly' });
@@ -81,11 +84,13 @@ app.post('/api/ai/report', async (req, res) => {
   }
 
   const cacheKey = `report:${type}:${hashString(JSON.stringify(payload))}`;
-  const cached = getCache<ReportResult>(cacheKey);
-  if (cached) {
-    res.setHeader('X-Cache', 'HIT');
-    res.json(cached);
-    return;
+  if (!skipCache) {
+    const cached = getCache<ReportResult>(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      res.json(cached);
+      return;
+    }
   }
 
   if (!canCall()) {
@@ -95,8 +100,9 @@ app.post('/api/ai/report', async (req, res) => {
 
   const result = await callReport(payload, type);
   setCache(cacheKey, result, getCacheTtlHours());
+  // 真的调了 AI 就计一次额度。这不违反"缓存命中不消耗"——那次请求压根没调 AI，这次调了
   incrementCall();
-  res.setHeader('X-Cache', 'MISS');
+  res.setHeader('X-Cache', skipCache ? 'BYPASS' : 'MISS');
   res.json(result);
 });
 

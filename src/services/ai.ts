@@ -71,6 +71,16 @@ export async function parseText(text: string): Promise<ParsedResult> {
   return postJson<ParsedResult>('/api/ai/parse', { text });
 }
 
-export async function generateReport(payload: object, type: 'daily' | 'weekly'): Promise<ReportResult> {
-  return postJson<ReportResult>('/api/ai/report', { payload, type });
+export async function generateReport(
+  payload: object,
+  type: 'daily' | 'weekly',
+  options?: { skipCache?: boolean },
+): Promise<ReportResult> {
+  return postJson<ReportResult>('/api/ai/report', {
+    payload,
+    type,
+    // 「重新生成」要的是换一段文案。不带这个标记时，数据没变会命中服务端响应缓存，
+    // 用户点完却看到一模一样的分析，会以为按钮坏了
+    skipCache: options?.skipCache === true,
+  });
 }

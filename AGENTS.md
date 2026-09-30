@@ -112,7 +112,8 @@ npm run typecheck    # TypeScript 类型检查
 - **Phase 2**：浏览器中完成"输入文字 → 看到确认卡片 → 点击保存 → 今日汇总更新"全流程
 - **Phase 3**：Chrome 中点击麦克风按钮，语音识别结果进入解析流程
 - **Phase 4**：食物库和补剂方案能增删改查，食物库匹配逻辑经测试正确
-- **Phase 5**：能生成日报并正确展示 PFC 占比
+- **Phase 5**：能生成日报/周报并正确展示 PFC 占比；`/analysis` 的达标统计与两张趋势图
+  和报告页对同一区间算出的数值一致，且不消耗 AI 额度
 
 ---
 
@@ -422,3 +423,92 @@ npm run typecheck    # TypeScript 类型检查
 - 说明（历史数据语义，用户提问确认过）：改或删食物库条目**都不会**回改已记录的餐次 ——
   `foodItems` 存的是写入当时的营养快照，`foodLibraryId` 只是裸 id（无外键、无级联）。
   唯一会"回头查库"的路径是：编辑一条"缺克数且带 foodLibraryId"的条目、给它补上克数时按库重算
+
+### 2026-09-30 Phase 5（日报/周报 + 营养分析与可视化）
+- 决策：新增 `src/services/report.ts`，把**所有聚合、达标判断、PFC 占比**收在这一层，
+  页面只负责画。`aggregateDaily(date)` 是唯一的日聚合入口，`aggregateWeekly(start, end)`
+  内部就是 `dates.map(aggregateDaily)` —— 虽然名字带 Weekly，参数却是任意起止日期
+- 决策：PFC 占比一律用 **kcal 口径**（P×4 / C×4 / F×9），不是克数占比。
+  100g 蛋白和 100g 脂肪克数相同、热量差 2.25 倍，按克数算会严重失真
+- 决策：热量**达标 = 目标 ±10%**；**分母是"有记录的天数"而不是区间天数** ——
+  "7 天里记了 3 天、其中 2 天达标"应该是 66.7%，除以 7 会显示 28.6%，看着像系统坏了。
+  一天都没记录时 `daysOnTargetPercent = null`，页面显示「—」而不是 0%
+- 决策：周报的 `average` 除以**有记录的天数**，不是 7。把没记录的日子当 0 算进平均没有意义
+- 决策：**蛋白质达标只看下限（≥ 目标的 90%）**，规则放在 `report.ts` 里和 `isKcalOnTarget` 作伴。
+  热量吃超了要提醒，蛋白质吃超了不是问题，用 ±10% 会把"练得多吃得也多"判成不达标
+- 决策：报告**不自动生成**，必须用户点按钮。AI 有成本，而且用户可能只想看历史报告
+- 决策：报告过期提示用"快照 vs 实时聚合"比对，**不比时间戳** ——
+  删除记录不会产生更新的时间戳，但总量和条目数会变。日报比 `intake` + `supplementIntake` +
+  各餐次条目数；周报比 `daysLogged` + 七天 `intake` 合计（两种 aggregate 形状不同，
+  所以是两个函数而不是一个联合类型，将来加月报也是同样路径）
+- 决策：`generateDailyReport` / `generateWeeklyReport` 的 `force = true` 表示「重新生成」，
+  语义是**换一段文案**（用户对上一段不满意才点的），所以两层缓存都要跳过：
+  本地已存报告（Dexie）+ 服务端响应缓存（`skipCache`）。见下方 Phase 5 补丁
+- 决策：AI payload 精简 —— 只带汇总（intake / target / supplementIntake /
+  supplementsTaken / 各餐次 totals + itemCount），**不带逐条食物**。控制 token，
+  也避免模型编造"你吃了什么"。`reportPrompt` 里加了"输入没有逐条明细，不要编造"和
+  "`hasRecords=false` 时 suggestions 必须返回空数组"
+- 决策：`/analysis` 复用 `aggregateWeekly` 而不是在页面里再循环一遍 `aggregateDaily` ——
+  后者要把 average / daysLogged / daysOnTarget 重算一遍，将来改口径两边必然不一致。
+  函数名与用途错位，但 AGENTS.md 禁止重命名已有函数，所以保留原名
+- 决策：`PFC_COLORS` 抽到 `src/components/pfcColors.ts`。饼图和堆叠柱状图必须是同一套色，
+  两个页面各写一份的话，同一种营养素在两页颜色不一样，读图的人会以为自己看错了
+- 决策：把 Today 里的目标进度条抽成 `src/components/TargetBar.tsx`（Today 和报告页共用），
+  并加 `compact` 变体给报告页的三列窄布局 —— 窄列里 CJK 会把「目标」拆成两行，
+  而且同一列里数值会出现两次（标题行一次、进度条一次）
+- 踩坑：**`ReferenceLine` 的默认 `ifOverflow` 是 `discard`**，目标 2200、实际摄入 600 时
+  Y 轴只按数据自适应到 1200，目标线被直接扔到画布外**根本看不见** —— 而且不报错、不留空位，
+  只是"少了一根线"。必须显式写 `ifOverflow="extendDomain"` 才会把 Y 轴撑到目标值。
+  全项目 3 处 `ReferenceLine`（分析页折线、分析页堆叠柱、周报折线）都已加；
+  没有 `ReferenceArea` / `ReferenceDot`，也没有显式 `domain=` 覆盖
+- 踩坑：**recharts v3 的 `<Legend>` 类型里没有 `payload`**（被 `Omit` 掉了），
+  想固定图例顺序不能传 payload；自动排序出来还是倒的（碳水/脂肪/蛋白质）。
+  最后和饼图一样手写图例，用 flex 排
+- 踩坑：饼图在总热量为 0 时不能画 —— 三个扇区都是 0，recharts 会算出 NaN 角度。
+  兜底显示"没有营养数据，画不出占比"
+- 踩坑：折线图的"没记录的一天"要给 `null` 而不是 0，配 `connectNulls={false}` 让线断开；
+  填 0 会画成一条掉到底的实线，看不出中间断过记录。但**堆叠柱状图相反**，
+  没记录给 0 即可 —— 柱子没有"把两天连起来"的歧义，0 高度还能保住 X 轴上的档位
+- 踩坑（验证方法本身，第二次遇到）：Playwright 的 `fill()` / `pressSequentially()`
+  对 `<input type="date">` **不触发 React 的 onChange**，DOM 值看着变了但 state 没变
+  （表现为"改了日期区间和图表都没动"）。上一阶段在 `<input type="time">` 上遇到过同一个问题。
+  可用的替代是内置浏览器无障碍层的 `setValue(elementIndex, value)`，走的是真实输入路径
+- 踩坑：用 `console.log` 探针 + `tab.dev.logs()` 数函数调用次数，验证"`aggregateWeekly`
+  是不是每次 render 都跑" —— 结果是只有"进周报 tab / 换周"才跑一次
+  （`loadWeekly` 是 `useCallback([], ...)`、`weekEnd` 是 `useMemo`，effect 依赖稳定）。
+  探针验完已删。**这类"某函数是不是被调太多次"的问题，日志探针比读代码靠谱**
+- 踩坑：内置浏览器的标签页会**整个崩掉**（`This page crashed`），症状是页面永远停在
+  「正在汇总…」、CDP 命令超时。看起来像是应用的死循环或 IndexedDB 卡住，其实换个标签页就好。
+  遇到"页面莫名不动"先换标签页重开，再怀疑代码
+
+#### 2026-09-30 Phase 5 补丁（`force` 穿透服务端缓存）
+- 背景：点「重新生成」时 `generatedAt` 变了、报告确实重写了，但 `used` 没涨、
+  AI 文案一字未改。查下来是服务端响应缓存 key = `'report:' + type + ':' + hash(payload)`，
+  数据没变 → payload 逐字相同 → 命中缓存 → 不调 AI 也不计额度（Phase 1 的原设计）
+- 决策：`force` 的语义定为**"换一段文案"**（用户点它是因为对上一段不满意），
+  不是"再走一遍流程"。所以前端 `generateReport` 加 `options.skipCache`，
+  `/api/ai/report` 读 `skipCache` 时**跳过读、照旧写、照旧计额度**
+- 决策：跳过读但**仍然写缓存**（新结果覆盖旧的），这样之后被动请求
+  （组件重挂载、切 Tab 切回来）拿到的是新那份，不会又变回最初的分析
+- 决策：`skipCache` **不能绕过限流** —— 额度满时它返回 429，
+  而普通请求命中缓存依然返回 200（Phase 1 那条"缓存命中不消耗额度"没有被破坏）
+- 决策：响应头多一个 `X-Cache: BYPASS`，区分"因为没缓存才调 AI"和"因为调用方要求穿透"
+- 踩坑：`tsx server/index.ts` **不监听文件变化**，改 `server/` 下的代码必须重启 `dev:server`
+  才生效，否则 curl 打到的还是旧逻辑（表现为"改了没反应"）
+- 验证：同一 payload 连打 5 次 —— 不带 skipCache 得 `MISS(used 1)` → `HIT(used 1)`；
+  带 skipCache 得 `BYPASS(used 2)` → `BYPASS(used 3)`，且文案确实变了；
+  最后不带 skipCache 读回是 `HIT(used 3)` 且内容是**穿透后那份新的**。
+  边界（临时把 `AI_DAILY_LIMIT` 设成 2）：used 满时带 skipCache 返回
+  `429 {"error":"Daily AI call limit reached"}`，不带 skipCache 读缓存仍 200 HIT
+
+#### 2026-09-30 Phase 5 验收
+- 规格里 14 条验证清单**全部在内置 Chromium 里跑过**（报告生成/重生成/缓存命中、
+  过期提示条 + 内联重生成、AI 代理挂掉时的错误态与重试、周报生成、分析页 7/30/自定义区间、
+  无记录日生成日报、AI 调用对账、Phase 2.6 等比缩放回归、Record→Today 回归、跨页一致性）
+- 关键对账：`/api/ai/status` 在"重新生成（数据未变）"、"反复进出分析页"、
+  "刷新看缓存报告"这几种操作下**计数不动**；只有真正调 AI 才 +1
+- 关键数字：改重量 200g→300g，鸡胸肉 P46→69 / F3.6→5.4 / kcal216.4→324.6（都精确 ×1.5），
+  餐次合计 404.9→513.1；还原后 Today 回到 404.9。日报总热量与 Today 当天总热量逐项一致
+- 说明：验证全部跑在**内置浏览器的独立 profile** 上（IndexedDB 与用户自己的 Chrome 不共享），
+  上面的数字来自造的测试数据。DevTools 的 Application 面板在只读沙盒里拿不到，
+  库层面的确认仍需要人工在 DevTools 里做
